@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -37,9 +38,20 @@ from spotipy.exceptions import SpotifyException
 from spotipy.oauth2 import SpotifyOAuth
 
 
+class SnapSpotError(Exception):
+    pass
+
+
+GLOBAL_CONFIG_PATH = "/etc/snapspot"
+
 SCOPES = (
     "user-read-playback-state,user-modify-playback-state,user-read-currently-playing"
 )
+
+LIBRESPOT = shutil.which("librespot")
+
+if LIBRESPOT is None:
+    raise SnapSpotError("librespot is not installed.")
 
 # Define regexes to match librespot output
 
@@ -53,7 +65,9 @@ RE_USER = re.compile(r".*librespot_core.*Authenticated as '(?P<username>.*)'")
 
 # Match playback status
 # 2025-01-25T14:41:56Z DEBUG librespot_connect::state] updated connect play status playing: true, paused: false, buffering: true
-RE_STATUS = re.compile(r"play status playing: (?P<playing>true|false), paused: (?P<paused>true|false), buffering")
+RE_STATUS = re.compile(
+    r"play status playing: (?P<playing>true|false), paused: (?P<paused>true|false), buffering"
+)
 
 # Match volumen
 # 2025-01-25T14:50:58Z INFO  librespot_connect::spirc] delayed volume update for all devices: volume is now 65535
@@ -67,6 +81,7 @@ def needs_spotify_token(error_return_value=None):
     Can take an optional parameter "error_return_value" to provide a custom
     return value if the token cannot be validated.
     """
+
     def _wrapper(func):
         @functools.wraps(func)
         def _refresh_token(self, *args, **kwargs):
@@ -80,6 +95,7 @@ def needs_spotify_token(error_return_value=None):
             return func(self, *args, **kwargs)
 
         return _refresh_token
+
     return _wrapper
 
 
@@ -103,16 +119,59 @@ class SnapSpot:
     In addition, if the current user is the same as the web api user then it is possible to control the playback
     stream.
     """
+
     def __init__(
         self,
+        client_id="",
+        client_secret="",
+        redirect_uri="",
+        credentials_location=None,
+        api_username="<NOT SET>",
         username="",
         password="",
-        extraargs="",
-        api_user=None,
+        name="",
+        bitrate="320",
+        volume="100",
+        onevent="",
+        normalize=False,
+        autoplay=None,
+        cache="",
+        disable_audio_cache=True,
+        backend="",
+        audio_device="",
+        params=list(),
     ):
-        self.extra_args = shlex.split(extraargs)
+        if not (client_id and client_secret):
+            raise SnapSpotError("client_id and client_secret values must be set.")
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.redirect_uri = redirect_uri
+
+        self.librespot_args = []
+        if username and password:
+            self.librespot_args.extend(["--username", username, "--password", password])
+        if devicename:
+            self.librespot_args.extend(["--name", devicename])
+        self.librespot_args.extend(["--bitrate", bitrate])
+        self.librespot_args.extend(["--initial-volume", volume])
+        if onevent:
+            self.librespot_args.extend(["--onevent", onevent])
+        if normalize:
+            self.librespot_args.append("--enable-volume-normalisation")
+        if autoplay:
+            self.librespot_args.extend(["--autoplay", autoplay])
+        if cache:
+            self.librespot_args.extend(["--cache", cache])
+        if disable_audio_cache:
+            self.librespot_args.extend("--disable-audio-cache")
+        if backend:
+            self.librespot_args.extend(["--backend", backend])
+        if audio_device:
+            self.librespot_args.extend(["--device", audio_device])
+        if self.params:
+            self.librespot_args.extend(params)
+
         self.proc = None
-        self._refresh_timer = None
 
         self._metadata = {}
         self._properties = {}
@@ -127,9 +186,7 @@ class SnapSpot:
         self.now_playing = ""
         self.track_cache = {}
 
-        self.args = ["-n", "snapcast"]
-
-        self.api_user = api_user or "<NOT SET>"
+        self.api_user = "<NOT SET>"
         self.playing_user = "<STARTUP>"
         self.set_user("", startup=True)
 
@@ -146,6 +203,7 @@ class SnapSpot:
 
         Where no callback is provided, a default no_op is used.
         """
+
         def no_op(_):
             pass
 
@@ -183,9 +241,9 @@ class SnapSpot:
         await self.debug("Opening Spotify API connection.")
         self.spotify = spotipy.Spotify(
             auth_manager=SpotifyOAuth(
-                client_id="",
-                client_secret="",
-                redirect_uri="http://127.0.0.1:12345",
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                redirect_uri=self.redirect_uri,
                 scope=SCOPES,
             )
         )
@@ -235,16 +293,8 @@ class SnapSpot:
     async def start_librespot(self):
         """Starts librespot process and loop to read output."""
         self.proc = await asyncio.create_subprocess_exec(
-            "librespot",
-            "-n",
-            "test async",
-            "-B",
-            "pipe",
-            "-d",
-            "/tmp/spotpipe",
-            "-R",
-            "100",
-            "-v",
+            LIBRESPOT,
+            *self.librespot_args,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -513,7 +563,9 @@ class SnapSpot:
 
     def seek(self, offset):
         """Seeks to current position + offset."""
-        position, error = self._send_spotify_command("current_user_playing_track", return_output=True)
+        position, error = self._send_spotify_command(
+            "current_user_playing_track", return_output=True
+        )
         if not position:
             return False, error
 
@@ -526,15 +578,156 @@ class SnapSpot:
         return self._send_spotify_command("seek_track", pos * 1000)
 
 
-if __name__ == "__main__":
+def vol(value):
+    """Limit volume to a value between 0 and 100."""
+    try:
+        value = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Volume must be an integer.")
+
+    return str(min(max(value, 0), 100))
+
+
+def snapspot():
+    parser = argparse.ArgumentParser(
+        description="Script plugin for Snapcast server. Provides additional metadata for librespot streams."
+    )
+
+    # Spotify API arguments
+    spotify = parser.add_argument_group("Spotity API args")
+    spotify.add_argument("--client_id", help="Client ID for Spotify API")
+    spotify.add_argument("--client_secret", help="Client secret for Spotify API")
+    spotify.add_argument("--redirect_uri", help="Redirect URI for Spotify API")
+    spotify.add_argument(
+        "--cache_location",
+        help=(
+            "Location for storing Spotify API credentials. "
+            "Must be writable by owner of snapserver process."
+        ),
+    )
+
+    # Librespot configuration options
+    librespot = parser.add_argument_group("Librespot configuration options")
+    librespot.add_argument("--username", help="Username for librespot.")
+    librespot.add_argument("--password", help="Password for librespot user.")
+    librespot.add_argument("--devicename", help="Device name for librespot.")
+    librespot.add_argument(
+        "--bitrate",
+        choices=["96", "160", "320"],
+        default="320",
+        help="Bitrate for audio stream.",
+    )
+    librespot.add_argument(
+        "--volume", type=vol, help="Initial volume in percent %% [0-100]."
+    )
+    librespot.add_argument(
+        "--onevent",
+        help="Path to a script that gets run when one of librespot's events is triggered.",
+    )
+    normalize = librespot.add_mutually_exclusive_group()
+    normalize.add_argument(
+        "--enable_normalize",
+        dest="normalize",
+        action="store_const",
+        const=True,
+        help="Enable volume normalisation for librespot.",
+    )
+    normalize.add_argument(
+        "--disable_normalize",
+        dest="normalize",
+        action="store_const",
+        const=False,
+        help="Disable volume normalisation for librespot.",
+    )
+    librespot.add_argument(
+        "--autoplay",
+        choices=["on", "off"],
+        help="Autoplay similar songs when your music ends.",
+    )
+    librespot.add_argument(
+        "--cache", help="Path to a directory where files will be cached."
+    )
+    cache = librespot.add_mutually_exclusive_group()
+    cache.add_argument(
+        "--enable_audio_cache",
+        dest="disable_audio_cache",
+        action="store_const",
+        const=False,
+        help="Enable caching of the audio data (disabled by default).",
+    )
+    cache.add_argument(
+        "--disable_audio_cache",
+        dest="disable_audio_cache",
+        action="store_const",
+        const=True,
+        help="Disable caching of the audio data (disabled by default).",
+    )
+    librespot.add_argument(
+        "--backend",
+        help="Audio backend to use.",
+    )
+    librespot.add_argument(
+        "--audio_device",
+        help="Audio device to use.",
+    )
+    librespot.add_argument(
+        "--params",
+        nargs=argparse.REMAINDER,
+        help=(
+            "Optional string appended to the librespot invocation. "
+            "Must be the last argument."
+        ),
+    )
+    args_dict = vars(parser.parse_args())
+    cmdline_args = {k: v for k, v in args_dict.items() if v is not None}
+
+    # Load global settings from config file
+    global_settings = {}
     cp = ConfigParser()
 
-    # if cp.read(
-    #     [Path("/etc/tvhaudio"), Path("~/.config/tvhaudio/config.ini").expanduser()]
-    # ):
-    #     settings = cp["settings"]
-    # else:
-    #     settings = {}
+    if cp.read(Path(GLOBAL_CONFIG_PATH)):
+        for section in ("spotify", "librespot"):
+            if section in cp:
+                for key, val in cp.items(section):
+                    if not val:
+                        continue
+                    if key == "normalize":
+                        global_settings[key] = cp.getboolean(
+                            section, key, fallback=True
+                        )
+                    elif key == "disable_audio_cache":
+                        global_settings[key] = cp.getboolean(
+                            section, key, fallback=True
+                        )
+                    elif key == "volume":
+                        global_settings = cp.getint(section, key, fallback=100)
+                    elif key == "params":
+                        global_settings[key] = shlex.split(val)
+                    else:
+                        global_settings[key] = val
 
-    plugin = SnapSpot()  # **settings)
+        global_settings = {k: v for k, v in global_settings.items() if v}
+
+    environment_settings = {
+        "client_id": os.environ.get("SNAPSPOT_CLIENT_ID", None),
+        "client_secret": os.environ.get("SNAPSPOT_CLIENT_SECRET", None),
+    }
+    environment_settings = {k: v for k, v in environment_settings.items() if v}
+
+    # Session settings
+    # Settings preference order:
+    # 1: command line args
+    # 2: environmental args
+    # 3: global settings
+    settings = {**global_settings, **environment_settings, **cmdline_args}
+
+    # Start the plugin
+    try:
+        plugin = SnapSpot(**settings)
+    except SnapSpotError as e:
+        sys.exit(f"Error. Cannot start snapspot: {e}")
     plugin.start()
+
+
+if __name__ == "__main__":
+    snapspot()
