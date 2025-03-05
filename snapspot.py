@@ -43,7 +43,7 @@ class SnapSpotError(Exception):
     pass
 
 
-GLOBAL_CONFIG_PATH = "/etc/snapspot"
+GLOBAL_CONFIG_PATH = Path("~/.config/snapspot/config.ini").expanduser().as_posix()
 
 SCOPES = (
     "user-read-playback-state,user-modify-playback-state,user-read-currently-playing"
@@ -137,9 +137,10 @@ class SnapSpot:
         autoplay=None,
         cache="",
         disable_audio_cache=True,
-        backend="",
-        audio_device="",
+        backend="pipe",
+        audio_device="/tmp/spotpipe",
         params=list(),
+        **kwargs
     ):
         if not (client_id and client_secret):
             raise SnapSpotError("client_id and client_secret values must be set.")
@@ -246,10 +247,8 @@ class SnapSpot:
         await self.send(method="Plugin.Stream.Ready")
         self.queue(self._read_stdin())
         await self._stop_event.wait()
-        print("Cancelling tasks")
         for task in self._tasks:
             task.cancel()
-        print("Done")
 
     async def _do_api_login(self):
         """Creates the Spotify API connection."""
@@ -641,6 +640,11 @@ def snapspot():
         description="Script plugin for Snapcast server. Provides additional metadata for librespot streams."
     )
 
+    # Arguments set by snapserver. We need to accept them but not show them in help.
+    parser.add_argument("--stream", help=argparse.SUPPRESS)
+    parser.add_argument("--snapcast-port", help=argparse.SUPPRESS)
+    parser.add_argument("--snapcast-host", help=argparse.SUPPRESS)
+
     # Allow user to specify a different config file
     spotargs = parser.add_argument_group("snapspot args")
     spotargs.add_argument(
@@ -776,7 +780,8 @@ def snapspot():
     # 2: environmental args
     # 3: global settings
     settings = {**global_settings, **environment_settings, **cmdline_args}
-    del settings["config"]
+    if "config" in settings:
+        del settings["config"]
 
     # Start the plugin
     try:
