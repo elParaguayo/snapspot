@@ -140,6 +140,7 @@ class SnapSpot:
         backend="pipe",
         audio_device="/tmp/spotpipe",
         params=list(),
+        debug=False,
         **kwargs
     ):
         if not (client_id and client_secret):
@@ -196,6 +197,8 @@ class SnapSpot:
         self._librespot_ready = asyncio.Event()
         self._stop_event = asyncio.Event()
         self._tasks = []
+
+        self.verbose = debug
 
     def start(self):
         """Entry point to start the plugin."""
@@ -348,6 +351,8 @@ class SnapSpot:
                 await self.update_status(playing, paused)
             elif volume := RE_VOLUME.search(line):
                 await self.update_volume(int(volume.group("volume")))
+            elif self.verbose:
+                await self.debug(line)
 
     async def get_item(self, item):
         """Entry point to retrieve metadata for a Spotify item."""
@@ -649,6 +654,9 @@ def snapspot():
     spotargs = parser.add_argument_group("snapspot args")
     spotargs.add_argument(
         "-c", "--config", type=check_file, help="Path to configuration file"
+    )
+    spotargs.add_argument(
+        "--debug", action="store_true", help="Enable debugging."
     )
 
     # Spotify API arguments
