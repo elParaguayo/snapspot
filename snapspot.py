@@ -65,10 +65,8 @@ RE_TRACK_ID = re.compile(r".*librespot_playback.*Spotify URI <(?P<uri>spotify:.*
 RE_USER = re.compile(r".*librespot_core.*Authenticated as '(?P<username>.*)'")
 
 # Match playback status
-# 2025-01-25T14:41:56Z DEBUG librespot_connect::state] updated connect play status playing: true, paused: false, buffering: true
-RE_STATUS = re.compile(
-    r"play status playing: (?P<playing>true|false), paused: (?P<paused>true|false), buffering"
-)
+# [2025-03-08T12:29:26Z TRACE librespot_connect::spirc] ==> kPlayStatusPause
+RE_STATUS = re.compile(r"kPlayStatus(?P<status>Play|Pause|Stop|Loading)$")
 
 # Match volumen
 # 2025-01-25T14:50:58Z INFO  librespot_connect::spirc] delayed volume update for all devices: volume is now 65535
@@ -346,9 +344,8 @@ class SnapSpot:
             elif track := RE_TRACK_ID.match(line):
                 await self.get_item(track.group("uri"))
             elif status := RE_STATUS.search(line):
-                playing = status.group("playing") == "true"
-                paused = status.group("paused") == "true"
-                await self.update_status(playing, paused)
+                mode = status.group("status")
+                await self.update_status(mode)
             elif volume := RE_VOLUME.search(line):
                 await self.update_volume(int(volume.group("volume")))
             elif self.verbose:
@@ -470,11 +467,11 @@ class SnapSpot:
         if not startup:
             self.queue(self.notify_properties())
 
-    async def update_status(self, playing, paused):
-        match playing, paused:
-            case True, True:
+    async def update_status(self, status):
+        match status:
+            case "Pause":
                 status = PlaybackStatus.Paused
-            case True, False:
+            case "Play":
                 status = PlaybackStatus.Playing
             case _:
                 status = PlaybackStatus.Stopped
