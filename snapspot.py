@@ -765,7 +765,7 @@ def snapspot():
                             section, key, fallback=True
                         )
                     elif key == "volume":
-                        global_settings = cp.getint(section, key, fallback=100)
+                        global_settings[key] = str(cp.getint(section, key, fallback=100))
                     elif key == "params":
                         global_settings[key] = shlex.split(val)
                     else:
